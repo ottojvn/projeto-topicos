@@ -1,0 +1,41 @@
+# ── Datasets brutos ─────────────────────────────────────────────────────────
+Data_DS2_polar-main/
+Data_DS2_raspberry-main/
+Data_DS2_raspberry_npz/
+Data_DS2_smartwatch-main/
+
+# ── Dados processados / splits ───────────────────────────────────────────────
+saida_full/
+saida_smoke/
+participantes_incompletos.csv
+
+# ── Relatórios e análises geradas ────────────────────────────────────────────
+reports_dataset/
+charts_output/
+history_gru.json
+saida_smoke/
+
+# ── Outputs de treinamento ───────────────────────────────────────────────────
+output/
+*.pt
+*.pth
+*.png
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Sistema ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

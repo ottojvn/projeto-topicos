@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import re
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -22,7 +24,6 @@ FILTER_ORDER  = 3
 SAVGOL_WINDOW = 15
 SAVGOL_POLY   = 3
 TRIM_S        = 10
-TARGET_WINDOW = int(20 * DEFAULT_FS)
 
 TEST_SIZE    = 0.15
 VAL_SIZE     = 0.15
@@ -104,6 +105,19 @@ def load_fault_intervals(fp: Path) -> list[tuple[float, float]]:
 
 
 def load_smartwatch_gt(fp: Path) -> Optional[pd.DataFrame]:
+    if fp.suffix.lower() == ".csv":
+        try:
+            df = pd.read_csv(fp)
+            if df.empty or "start_time" not in df.columns or "heart_rate" not in df.columns:
+                return None
+            df["datetime"] = pd.to_datetime(df["start_time"])
+            df["time"] = (df["datetime"] - df["datetime"].iloc[0]).dt.total_seconds()
+            df["hr_bpm"] = df["heart_rate"].astype(float)
+            return df[["time", "hr_bpm"]]
+        except Exception as e:
+            log.warning(f"Erro ao ler CSV {fp}: {e}")
+            return None
+
     with open(fp) as f:
         js = json.load(f)
 
@@ -137,7 +151,10 @@ def load_smartwatch_gt(fp: Path) -> Optional[pd.DataFrame]:
 
 def find_matching_gt(gt_root: Path, base_name: str) -> Optional[Path]:
     base_clean = re.sub(r"_bw_.*$", "", base_name)
-    return next(gt_root.rglob(f"{base_clean}_HeartRateData.json"), None)
+    gt_file = next(gt_root.rglob(f"{base_clean}_HeartRateData.csv"), None)
+    if gt_file is None:
+        gt_file = next(gt_root.rglob(f"{base_clean}_HeartRateData.json"), None)
+    return gt_file
 
 
 def extract_position_from_filename(fp: Path) -> Optional[int]:
@@ -224,19 +241,69 @@ def sliding_window_with_gt(
     return np.stack(X_out, dtype=np.float32), np.array(y_out, dtype=np.float32), diag
 
 
-def build_windows(
+def compute_subject_split(
+    files: list[Path],
+    gt_dir: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, str]]:
+    subjects_set = set()
+    for fp in files:
+        if extract_position_from_filename(fp) is None:
+            continue
+        gt_fp = find_matching_gt(gt_dir, fp.stem)
+        if gt_fp is None:
+            continue
+        subj = extract_subject_from_gt(gt_fp)
+        if subj not in INVALID_SUBJECTS:
+            subjects_set.add(subj)
+
+    rng = np.random.default_rng(RANDOM_STATE)
+    subjects = np.array(sorted(subjects_set), dtype=np.int32)
+    rng.shuffle(subjects)
+
+    n_test = max(1, round(len(subjects) * TEST_SIZE))
+    n_val  = max(1, round(len(subjects) * VAL_SIZE))
+
+    test_subjs  = subjects[:n_test]
+    val_subjs   = subjects[n_test:n_test + n_val]
+    train_subjs = subjects[n_test + n_val:]
+
+    subj_to_split: dict[int, str] = {}
+    for s in train_subjs:
+        subj_to_split[int(s)] = "train"
+    for s in val_subjs:
+        subj_to_split[int(s)] = "val"
+    for s in test_subjs:
+        subj_to_split[int(s)] = "test"
+
+    return train_subjs, val_subjs, test_subjs, subj_to_split
+
+
+def run_pipeline(
     dataset_path: Path,
     gt_dir: Path,
+    out_dir: Path,
     fs: float,
     window_sec: float,
     step_sec: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-
+) -> None:
     fault_intervals = load_fault_intervals(gt_dir.parent / "faltas.txt")
     files = sorted(dataset_path.rglob("*.npz"))
     log.info(f"CSI files found: {len(files)}")
 
-    all_X, all_y, all_p, all_s = [], [], [], []
+    train_subjs, val_subjs, test_subjs, subj_to_split = compute_subject_split(files, gt_dir)
+    log.info(
+        f"Split — train: {len(train_subjs)} | val: {len(val_subjs)} | test: {len(test_subjs)} subjects"
+    )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = out_dir / "_temp_chunks"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_counts = {"train": 0, "val": 0, "test": 0}
+    window_counts = {"train": 0, "val": 0, "test": 0}
+    all_y_vals: list[float] = []
 
     for fp in files:
         pos = extract_position_from_filename(fp)
@@ -248,8 +315,10 @@ def build_windows(
             continue
 
         subject = extract_subject_from_gt(gt_fp)
-        if subject in INVALID_SUBJECTS:
+        if subject in INVALID_SUBJECTS or subject not in subj_to_split:
             continue
+
+        split_name = subj_to_split[subject]
 
         gt_df = load_smartwatch_gt(gt_fp)
         if gt_df is None or len(gt_df) == 0:
@@ -267,84 +336,125 @@ def build_windows(
         cut    = int(TRIM_S * fs_eff)
 
         X = preprocess_signal(X_raw, fs_eff)
+        del X_raw
         if X.shape[0] <= cut:
+            del X
             continue
         X  = X[cut:]
-        ts = ts[cut:] if ts is not None and ts.size == X_raw.shape[0] else None
+        ts = ts[cut:] if ts is not None and ts.size == (X.shape[0] + cut) else None
 
         window = int(window_sec * fs_eff)
         step   = max(1, int(step_sec * fs_eff))
 
         if X.shape[0] < window:
+            del X
             continue
 
         Xw, yw, diag = sliding_window_with_gt(
             X, ts, gt_df, fs_eff, window, step, fault_intervals,
         )
+        del X, ts, gt_df
+
         if Xw is None:
             log.warning(f"NO WINDOWS | {fp.name} | {diag}")
             continue
 
-        if Xw.shape[1] != TARGET_WINDOW:
-            log.warning(f"Window shape mismatch {Xw.shape[1]} → {TARGET_WINDOW} | {fp.name}")
-            Xw = Xw[:, :TARGET_WINDOW, :]
+        target_window = int(window_sec * fs)
+        if Xw.shape[1] != target_window:
+            log.warning(f"Window shape mismatch {Xw.shape[1]} → {target_window} | {fp.name}")
+            if Xw.shape[1] > target_window:
+                Xw = Xw[:, :target_window, :]
+            else:
+                pad_width = target_window - Xw.shape[1]
+                Xw = np.pad(Xw, ((0, 0), (0, pad_width), (0, 0)), mode="edge")
 
         log.info(
-            f"OK | {fp.name} | pos={pos} subj={subject} | fs={fs_eff:.1f} Hz"
+            f"OK | {fp.name} | pos={pos} subj={subject} [{split_name}] | fs={fs_eff:.1f} Hz"
             f" | windows={len(Xw)} | mean_dt={diag['mean_abs_dt']:.3f}s"
         )
-        all_X.append(Xw)
-        all_y.append(yw)
-        all_p.append(np.full(len(Xw), pos,     dtype=np.int32))
-        all_s.append(np.full(len(Xw), subject, dtype=np.int32))
 
-    if not all_X:
+        n_w = len(Xw)
+        c_idx = chunk_counts[split_name]
+        chunk_file = temp_dir / f"{split_name}_{c_idx:06d}.npz"
+        np.savez(
+            chunk_file,
+            X=Xw.astype(np.float16),
+            y=yw,
+            p=np.full(n_w, pos, dtype=np.int32),
+            s=np.full(n_w, subject, dtype=np.int32),
+        )
+        chunk_counts[split_name] += 1
+        window_counts[split_name] += n_w
+        all_y_vals.extend(yw.tolist())
+
+        del Xw, yw
+        gc.collect()
+
+    if sum(window_counts.values()) == 0:
+        shutil.rmtree(temp_dir, ignore_errors=True)
         raise RuntimeError("No windows generated. Check dataset and GT paths.")
 
-    return (
-        np.concatenate(all_X, dtype=np.float32),
-        np.concatenate(all_y, dtype=np.float32),
-        np.concatenate(all_p, dtype=np.int32),
-        np.concatenate(all_s, dtype=np.int32),
+    y_arr = np.array(all_y_vals, dtype=np.float32)
+    log.info(
+        f"Dataset total windows: {len(y_arr)} | "
+        f"HR: [{y_arr.min():.0f}, {y_arr.max():.0f}] BPM | mean={y_arr.mean():.1f}"
     )
+    del all_y_vals, y_arr
+    gc.collect()
 
+    split_subj_map = {
+        "train": train_subjs,
+        "val": val_subjs,
+        "test": test_subjs,
+    }
 
-def split_and_save(
-    X: np.ndarray,
-    y: np.ndarray,
-    p: np.ndarray,
-    s: np.ndarray,
-    out_dir: Path,
-) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    current_idx_offset = 0
+    for split_name in ("train", "val", "test"):
+        n_chunks = chunk_counts[split_name]
+        subj_set = split_subj_map[split_name]
+        if n_chunks == 0:
+            log.warning(f"Split {split_name} has 0 chunks!")
+            continue
 
-    rng      = np.random.default_rng(RANDOM_STATE)
-    subjects = np.unique(s)
-    rng.shuffle(subjects)
+        split_X: list[np.ndarray] = []
+        split_y: list[np.ndarray] = []
+        split_p: list[np.ndarray] = []
+        split_s: list[np.ndarray] = []
 
-    n_test = max(1, round(len(subjects) * TEST_SIZE))
-    n_val  = max(1, round(len(subjects) * VAL_SIZE))
+        for c_i in range(n_chunks):
+            chunk_fp = temp_dir / f"{split_name}_{c_i:06d}.npz"
+            with np.load(chunk_fp) as data:
+                split_X.append(data["X"])
+                split_y.append(data["y"])
+                split_p.append(data["p"])
+                split_s.append(data["s"])
+            chunk_fp.unlink(missing_ok=True)
 
-    test_subjs  = subjects[:n_test]
-    val_subjs   = subjects[n_test:n_test + n_val]
-    train_subjs = subjects[n_test + n_val:]
+        X_cat = np.concatenate(split_X, axis=0)
+        y_cat = np.concatenate(split_y, axis=0)
+        p_cat = np.concatenate(split_p, axis=0)
+        s_cat = np.concatenate(split_s, axis=0)
+        del split_X, split_y, split_p, split_s
+        gc.collect()
 
-    log.info(f"Split — train: {len(train_subjs)} | val: {len(val_subjs)} | test: {len(test_subjs)} subjects")
+        n_split = len(X_cat)
+        idx_split = np.arange(current_idx_offset, current_idx_offset + n_split, dtype=np.int64)
+        current_idx_offset += n_split
 
-    def _save(name: str, subj_set: np.ndarray) -> None:
-        mask = np.isin(s, subj_set)
-        idx  = np.where(mask)[0]
-        np.savez_compressed(out_dir / f"X_{name}.npz", X=X[mask])
-        np.save(out_dir / f"y_{name}.npy",            y[mask])
-        np.save(out_dir / f"positions_{name}.npy",    p[mask])
-        np.save(out_dir / f"subject_{name}.npy",      s[mask])
-        np.save(out_dir / f"idx_{name}.npy",          idx)
-        np.save(out_dir / f"subjects_{name}_ids.npy", subj_set)
-        log.info(f"  {name:5s}: {mask.sum():>6} windows | subjects: {sorted(subj_set)}")
+        np.savez_compressed(out_dir / f"X_{split_name}.npz", X=X_cat)
+        np.save(out_dir / f"y_{split_name}.npy",            y_cat)
+        np.save(out_dir / f"positions_{split_name}.npy",    p_cat)
+        np.save(out_dir / f"subject_{split_name}.npy",      s_cat)
+        np.save(out_dir / f"idx_{split_name}.npy",          idx_split)
+        np.save(out_dir / f"subjects_{split_name}_ids.npy", subj_set)
 
-    _save("train", train_subjs)
-    _save("val",   val_subjs)
-    _save("test",  test_subjs)
+        log.info(f"  {split_name:5s}: {n_split:>6} windows | subjects: {sorted(subj_set)}")
+
+        del X_cat, y_cat, p_cat, s_cat, idx_split
+        gc.collect()
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    log.info("Preprocessing complete.")
 
 
 def main() -> None:
@@ -357,16 +467,14 @@ def main() -> None:
     ap.add_argument("--step_sec",     type=float, default=0.5,        help="Sliding window step (s)")
     args = ap.parse_args()
 
-    X, y, p, s = build_windows(
-        Path(args.dataset_path),
-        Path(args.gt_dir),
-        args.fs,
-        args.window_sec,
-        args.step_sec,
+    run_pipeline(
+        dataset_path=Path(args.dataset_path),
+        gt_dir=Path(args.gt_dir),
+        out_dir=Path(args.out_dir),
+        fs=args.fs,
+        window_sec=args.window_sec,
+        step_sec=args.step_sec,
     )
-
-    log.info(f"Dataset — X: {X.shape} | HR: [{y.min():.0f}, {y.max():.0f}] BPM | mean={y.mean():.1f}")
-    split_and_save(X.astype(np.float16), y, p, s, Path(args.out_dir))
 
 
 if __name__ == "__main__":

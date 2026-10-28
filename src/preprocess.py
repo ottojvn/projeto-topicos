@@ -149,12 +149,22 @@ def load_smartwatch_gt(fp: Path) -> Optional[pd.DataFrame]:
     return df[["time", "hr_bpm"]]
 
 
-def find_matching_gt(gt_root: Path, base_name: str) -> Optional[Path]:
+def build_gt_index(gt_root: Path) -> dict[str, Path]:
+    """Indexa previamente todos os arquivos de ground truth (.csv e .json) em memória."""
+    index: dict[str, Path] = {}
+    for fp in gt_root.rglob("*_HeartRateData.*"):
+        if fp.suffix.lower() in (".csv", ".json"):
+            # Exemplo: 08_2025_07_02_-_17_50_50_HeartRateData.csv -> 08_2025_07_02_-_17_50_50
+            clean_name = re.sub(r"_HeartRateData\.(csv|json)$", "", fp.name, flags=re.IGNORECASE)
+            # Prioriza CSV se ambos existirem
+            if clean_name not in index or fp.suffix.lower() == ".csv":
+                index[clean_name] = fp
+    return index
+
+
+def find_matching_gt(gt_index: dict[str, Path], base_name: str) -> Optional[Path]:
     base_clean = re.sub(r"_bw_.*$", "", base_name)
-    gt_file = next(gt_root.rglob(f"{base_clean}_HeartRateData.csv"), None)
-    if gt_file is None:
-        gt_file = next(gt_root.rglob(f"{base_clean}_HeartRateData.json"), None)
-    return gt_file
+    return gt_index.get(base_clean)
 
 
 def extract_position_from_filename(fp: Path) -> Optional[int]:
@@ -243,13 +253,13 @@ def sliding_window_with_gt(
 
 def compute_subject_split(
     files: list[Path],
-    gt_dir: Path,
+    gt_index: dict[str, Path],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, str]]:
     subjects_set = set()
     for fp in files:
         if extract_position_from_filename(fp) is None:
             continue
-        gt_fp = find_matching_gt(gt_dir, fp.stem)
+        gt_fp = find_matching_gt(gt_index, fp.stem)
         if gt_fp is None:
             continue
         subj = extract_subject_from_gt(gt_fp)
@@ -290,7 +300,11 @@ def run_pipeline(
     files = sorted(dataset_path.rglob("*.npz"))
     log.info(f"CSI files found: {len(files)}")
 
-    train_subjs, val_subjs, test_subjs, subj_to_split = compute_subject_split(files, gt_dir)
+    log.info("Indexing ground truth files...")
+    gt_index = build_gt_index(gt_dir)
+    log.info(f"Ground truth files indexed: {len(gt_index)}")
+
+    train_subjs, val_subjs, test_subjs, subj_to_split = compute_subject_split(files, gt_index)
     log.info(
         f"Split — train: {len(train_subjs)} | val: {len(val_subjs)} | test: {len(test_subjs)} subjects"
     )
@@ -310,7 +324,7 @@ def run_pipeline(
         if pos is None:
             continue
 
-        gt_fp = find_matching_gt(gt_dir, fp.stem)
+        gt_fp = find_matching_gt(gt_index, fp.stem)
         if gt_fp is None:
             continue
 
